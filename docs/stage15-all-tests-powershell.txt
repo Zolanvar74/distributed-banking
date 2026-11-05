@@ -1,0 +1,220 @@
+DISTRIBUTED BANKING PLATFORM — STAGE 15
+PowerShell / Windows — دستورهای مرتب تست و دمو
+نسخه: بر مبنای سورس مرحله 14
+
+هشدار مهم: تست‌ها در دو وضعیت متفاوت اجرا می‌شوند. بلوک‌های PRE-CUTOVER را پس از انتقال مالکیت اجرا نکن.
+دستورهای این فایل را بلوک‌به‌بلوک کپی کن، نه همه فایل را یکجا.
+هرگز docker compose down -v، حذف volume، ویرایش مستقیم Shard Map یا استفاده از request_id جدید برای یک پرداخت نامطمئن انجام نده.
+اگر Self-Healing قبلاً یک Replica را جایگزین کرده، کانتینر قدیمیِ همان Slot را دستی Start نکن.
+برای هر مرحله خروجی SUCCESS/FAIL را در فایل گزارش ثبت کن؛ تنها PASS واقعی را در ویدیو نشان بده.
+
+============================================================================
+A) FIRST: FIX THE CURRENT ERROR — YOUR MAP IS STILL B, NOT C
+============================================================================
+# این بخش پیش از ضبط ویدیو است؛ اگر preflight پاس نشده، cutover را اجرا نکن.
+# حالا روی سیستم تو active map برابر A:1-1000 و B:1001-2000 است.
+# این حالت پیش از Cutover طبیعی است و verify_stage14 postcutover الزاماً Fail می‌دهد.
+
+docker compose ps
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=preflight
+
+# اگر preflight پیام 'run stage11 bootstrap ...' یا 'expected CATCHING_UP' داد:
+# بررسی وضعیت از دیتابیس بدون تغییر داده:
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT job_id,phase,epoch_before,epoch_after FROM migration_jobs ORDER BY created_at DESC LIMIT 5;"
+# در صورت نبود Job/ Snapshot ابتدا مرحله 10 و 11 را به ترتیب اجرا کن:
+docker compose run --rm schema-migrator python -m scripts.verify_stage10 --scenario=bootstrap
+docker compose run --rm schema-migrator python -m scripts.verify_stage11 --scenario=bootstrap
+# پس از bootstrap و در یک محیط بدون بار دیگر:
+docker compose run --rm schema-migrator python -m scripts.verify_stage11 --scenario=online
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=preflight
+
+# ONLY after PASS: بکاپ از دیتابیس‌ها بگیر. Cutover یک عملیات واقعی و یک‌طرفه است.
+# فقط یک بار اجرا کن؛ حین آن نویسنده آزمایشی دیگری روی حساب‌های مهاجر فعال نباشد.
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=cutover
+# حتماً باید STAGE 12 CUTOVER: ALL CHECKS PASSED چاپ شود.
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=stale
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=recovered
+
+# After ownership C is activated: archive old request IDs BEFORE monetary tests.
+docker compose run --rm schema-migrator python -m scripts.backfill_stage13
+docker compose run --rm schema-migrator python -m scripts.verify_stage13 --scenario=preflight
+# اکنون postcutover باید در شرایط مناسب PASS شود:
+docker compose run --rm schema-migrator python -m scripts.verify_stage14 --scenario=postcutover --json
+
+============================================================================
+B) SHORT VIDEO SCRIPT — RUN ONLY AFTER PART A PASSES (3–8 MIN OF COMMANDS)
+============================================================================
+# با PowerShell در مسیر دارای compose.yaml و بدون بار هم‌زمان دیگر
+# بعد از هر دستور PASS را روی صفحه نگه دار. اگر خطا داد به بخش عیب‌یابی برو.
+
+git log -1 --oneline
+git tag --list "stage-*"
+docker compose ps
+# Gateway API and current routing map:
+Invoke-RestMethod http://localhost:8000/health
+Invoke-RestMethod http://localhost:8000/debug/shard-map
+Invoke-RestMethod http://localhost:8000/accounts/A0500/balance
+Invoke-RestMethod http://localhost:8000/accounts/A1500/balance
+Invoke-RestMethod http://localhost:8000/accounts/A2000/balance
+# Isolated database / ownership, fencing, 6 healthy replica slots:
+docker compose run --rm schema-migrator python -m scripts.verify_stage14 --scenario=postcutover --json
+# Bonus I stale-route rejection, no old B writes:
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=stale
+# Transfer across A ↔ C + safe retry and payload conflict:
+docker compose run --rm schema-migrator python -m scripts.verify_stage13 --scenario=cross
+# Concurrent overlapping cross-shard transfers; conservation of money:
+docker compose run --rm schema-migrator python -m scripts.verify_stage13 --scenario=overlap
+# Historical B request replay should be idempotent on C:
+docker compose run --rm schema-migrator python -m scripts.verify_stage13 --scenario=legacy
+# Old B receives stale PREPARE directly and must reject it:
+docker compose run --rm schema-migrator python -m scripts.verify_stage13 --scenario=stale2pc
+# Metadata proof of generations and active replicas:
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT shard_id,slot,replica_id,generation,lifecycle,hostname FROM replica_registry ORDER BY shard_id,slot;"
+# GitHub state and Docker image list:
+git remote -v
+docker image ls distributed-banking-app
+
+============================================================================
+C) FULL TESTS BEFORE CUTOVER — ONLY IN A FRESH ISOLATED TEST PROJECT
+============================================================================
+# Old tests expect 2 shards / original replica hostnames and MUST NOT run after cutover.
+# Use a separate project (and unused port). Do not point commands at main production demo.
+# This preparation can take several minutes; do it before recording, not during.
+$env:COMPOSE_PROJECT_NAME = 'banking-precutover-demo'
+$env:GATEWAY_PORT = '8120'
+docker compose up --build -d
+docker compose run --rm schema-migrator python -m scripts.verify_stage02
+docker compose run --rm schema-migrator python -m scripts.verify_stage03
+docker compose run --rm schema-migrator python -m scripts.verify_stage04 --scenario=normal
+docker compose run --rm schema-migrator python -m scripts.verify_stage05
+docker compose run --rm schema-migrator python -m scripts.verify_stage06
+# Manual replica stop ONLY when self-healing is paused/disabled, otherwise it gets replaced.
+# Stage04 a1-down test belongs to this isolated pre-cutover environment.
+docker compose stop self-healing
+docker compose stop shard-a-1
+docker compose run --rm schema-migrator python -m scripts.verify_stage04 --scenario=a1-down
+docker compose start shard-a-1
+docker compose start self-healing
+# Test source capture before any cutover:
+docker compose run --rm schema-migrator python -m scripts.verify_stage10 --scenario=bootstrap
+docker compose run --rm schema-migrator python -m scripts.verify_stage11 --scenario=bootstrap
+docker compose run --rm schema-migrator python -m scripts.verify_stage11 --scenario=online
+# Return to main project; inspect the project name before other operations.
+Remove-Item Env:COMPOSE_PROJECT_NAME
+Remove-Item Env:GATEWAY_PORT
+
+============================================================================
+D) 2PC COORDINATOR CRASH (STAGE 07) — FRESH PRE-CUTOVER LAB ONLY
+============================================================================
+# Entire sequence is meant for a disposable isolated project; do not rerun on C-owned main.
+# Copy block separately; record request_id; every uncertain transfer needs status query.
+$env:COMPOSE_PROJECT_NAME = 'banking-s07-demo'
+$env:GATEWAY_PORT = '8121'
+$env:STAGE07_ENABLE_FAULTS = '1'
+docker compose up --build -d
+docker compose up -d --no-deps --force-recreate coordinator
+$rid = 'stage07-demo-' + ([guid]::NewGuid().ToString('N'))
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=arm --request-id $rid
+$body = @{from_account='A0500';to_account='A1500';amount='1.00';request_id=$rid} | ConvertTo-Json
+try { Invoke-RestMethod -Uri 'http://localhost:8121/transfers' -Method Post -ContentType 'application/json' -Body $body } catch { Write-Host 'Expected coordinator interruption' }
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=crashed --request-id $rid
+docker compose start coordinator
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=recovered --request-id $rid
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=cleanup --request-id $rid
+$env:STAGE07_ENABLE_FAULTS = '0'
+docker compose up -d --no-deps --force-recreate coordinator
+Remove-Item Env:STAGE07_ENABLE_FAULTS
+Remove-Item Env:COMPOSE_PROJECT_NAME
+Remove-Item Env:GATEWAY_PORT
+
+============================================================================
+E) SELF-HEALING AND CONTROLLER CRASH (STAGES 08–09)
+============================================================================
+# Controller must use the fixed dict_row leader-lock logic (no KeyError:0).
+# Use a separate environment/port; tests are stateful and change replica generations.
+$env:COMPOSE_PROJECT_NAME = 'banking-s09-demo'
+$env:GATEWAY_PORT = '8122'
+docker compose up --build -d
+docker compose run --rm schema-migrator python -m scripts.verify_stage08 --scenario=preflight
+# For controlled controller crash, enable Stage09 fault and use TWO TERMINALS:
+$env:STAGE09_ENABLE_FAULTS = '1'
+docker compose up -d --no-deps --force-recreate self-healing
+$trial = [guid]::NewGuid().ToString()
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=arm --replica=B2 --point=AFTER_RESERVE --trial-id=$trial
+# Now in a 2nd window, with COMPOSE_PROJECT_NAME set to banking-s09-demo:
+# docker ps --filter "label=banking.project=banking-s09-demo" --filter "label=banking.shard=B" --filter "label=banking.slot=2" --filter "status=running" --format "{{.ID}}"
+# docker stop <CURRENT_B2_CONTAINER_ID>
+# Return to the first window:
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=crashed --trial-id=$trial
+docker compose start self-healing
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=recovered --trial-id=$trial
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=show --trial-id=$trial
+# The other points AFTER_CREATE, AFTER_START, AFTER_HEALTHY need NEW trial IDs each.
+$env:STAGE09_ENABLE_FAULTS = '0'
+docker compose up -d --no-deps --force-recreate self-healing
+Remove-Item Env:STAGE09_ENABLE_FAULTS
+Remove-Item Env:COMPOSE_PROJECT_NAME
+Remove-Item Env:GATEWAY_PORT
+
+============================================================================
+F) BONUS I — FOUR STAGE 14 CRASH POINTS: RUN IN FOUR FRESH LABS
+============================================================================
+# Detailed complete procedures: docs/stage14-final-acceptance.md
+# This compact block is a reminder, not a full one-click script.
+# Prepare each lab with COMPOSE_PROJECT_NAME and a distinct gateway port:
+# SNAPSHOT_PERSISTED: banking-s14-snapshot / 8114
+# DELTA_GROUP_APPLIED: banking-s14-delta / 8115
+# FENCING_GATE_CLOSED: banking-s14-fence / 8116
+# MAP_ACTIVATED: banking-s14-map / 8117
+# Each uses explicit arm, trigger, verify(crashed), manager restart, verify(recovered).
+# Example for SNAPSHOT point (fresh isolated lab only):
+$env:COMPOSE_PROJECT_NAME = 'banking-s14-snapshot'
+$env:GATEWAY_PORT = '8114'
+$env:STAGE14_ENABLE_FAULTS = '1'
+docker compose up --build -d
+docker compose run --rm schema-migrator python -m scripts.stage14_fault --action plan
+docker compose run --rm -e STAGE14_ENABLE_FAULTS=1 schema-migrator python -m scripts.stage14_fault --action arm --point SNAPSHOT_PERSISTED
+docker compose run --rm schema-migrator python -m scripts.stage14_fault --action trigger --point SNAPSHOT_PERSISTED
+docker compose run --rm schema-migrator python -m scripts.stage14_fault --action verify --point SNAPSHOT_PERSISTED --moment crashed
+$env:STAGE14_ENABLE_FAULTS = '0'
+docker compose up -d --no-deps --force-recreate migration-manager
+docker compose run --rm schema-migrator python -m scripts.verify_stage10 --scenario=bootstrap
+docker compose run --rm schema-migrator python -m scripts.stage14_fault --action verify --point SNAPSHOT_PERSISTED --moment recovered
+Remove-Item Env:STAGE14_ENABLE_FAULTS
+Remove-Item Env:COMPOSE_PROJECT_NAME
+Remove-Item Env:GATEWAY_PORT
+# For delta/fence/map follow docs/stage14-final-acceptance.md exactly; they require different setup.
+
+============================================================================
+G) GIT AND DELIVERY — AFTER TEST SUCCESS, FROM MAIN PROJECT
+============================================================================
+git status
+git diff --check
+git ls-files .env
+# Above command for .env should print NOTHING.
+git add .
+git commit -m 'docs: stage 15 final report and demo runbook'
+git push origin main
+# Only after real results are approved, and only if stage-15 does not exist:
+git tag stage-15
+git push origin stage-15
+# Docker Hub is separate: supply Docker Hub username first, use docker login,
+# tag and push the actual application image, then document repository link and tag.
+# Example (REPLACE YOUR_DOCKERHUB_USER and ensure image exists):
+# docker login
+# docker tag distributed-banking-app:stage14 YOUR_DOCKERHUB_USER/distributed-banking-app:stage15
+# docker push YOUR_DOCKERHUB_USER/distributed-banking-app:stage15
+
+============================================================================
+RECORDING PLAN (MAX 15 MIN)
+============================================================================
+00:00–01:00 Architecture & GitHub overview
+01:00–03:00 docker compose ps, Gateway and routing A/B/C
+03:00–05:00 Stage14 read-only audit + Stage12 stale guard
+05:00–08:00 Stage13 cross + overlap + legacy duplicate
+08:00–10:00 Self-Healing generation evidence + prior crash proof
+10:00–12:30 2PC durable decision / previously recorded crash+recovery evidence
+12:30–14:00 Bonus I 4 crash results (prior tested logs, no unverified claims)
+14:00–15:00 Docker Hub & report conclusions
+
+One more reminder: your CURRENT Stage14 failure shows Map still A,B. Do not claim Stage12–14 PASS until confirmed after cutover.

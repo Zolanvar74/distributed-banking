@@ -1,0 +1,470 @@
+# 00 READY-STATE CHECK - EXACTLY TWO SHARDS: A0001-A1000 ON A AND A1001-A2000 ON B
+Set-Location 'E:\SharifiProject\sharding\banking-video-ab'
+$env:COMPOSE_PROJECT_NAME = 'banking-video-ab'
+$env:GATEWAY_PORT = '8221'
+$env:STAGE07_ENABLE_FAULTS = '0'
+$env:STAGE09_ENABLE_FAULTS = '0'
+$env:STAGE14_ENABLE_FAULTS = '0'
+$base = 'http://localhost:8221'
+$ErrorActionPreference = 'Stop'
+function Require-DockerSuccess([string]$step) { if ($LASTEXITCODE -ne 0) { throw "Docker command failed: $step" } }
+function Wait-TxFinal([string]$id) {
+    for ($i=0; $i -lt 45; $i++) {
+        try {
+            $raw = & curl.exe --silent --show-error --max-time 8 "$base/transfers/requests/$id"
+            if ($LASTEXITCODE -eq 0 -and $raw) {
+                $result = $raw | ConvertFrom-Json
+                if ($result.status -in @('COMMITTED','ABORTED')) { return $result }
+            }
+        } catch { }
+        Start-Sleep -Seconds 2
+    }
+    throw "Transaction outcome unresolved: $id"
+}
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+docker compose config --quiet
+docker compose ps
+Invoke-RestMethod "$base/health" | ConvertTo-Json
+docker compose run --rm schema-migrator python -m scripts.demo_verify_ab
+if ($LASTEXITCODE -ne 0) { throw 'Initial A/B readiness failed: do not continue the demo' }
+
+# 01 REQUIRED EXPERIMENT 1 - SHARD DISTRIBUTION AND CORRECT GATEWAY ROUTING
+Invoke-RestMethod "$base/debug/shard-map" | ConvertTo-Json -Depth 8
+'A0001','A0500','A1000','A1001','A1500','A2000' | ForEach-Object { Invoke-RestMethod "$base/debug/route/$_" } | Format-Table
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT range_start,range_end,shard_id,epoch FROM shard_map WHERE active=true ORDER BY range_start;"
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT shard_id,desired_count FROM desired_replica_count ORDER BY shard_id;"
+$initialC = @(docker ps -a --filter "label=com.docker.compose.project=$env:COMPOSE_PROJECT_NAME" --format '{{.Names}}' | Where-Object { $_ -match 'shard-c-' })
+if ($initialC.Count -ne 0) { throw "Shard C already exists: $($initialC -join ', ')" }
+docker ps -a --filter "label=com.docker.compose.project=$env:COMPOSE_PROJECT_NAME" --format 'table {{.Names}}\t{{.Status}}' 
+docker compose exec -T shard-a-db psql -U banking -d shard_a -c "SELECT COUNT(*) AS total_accounts,MIN(account_id) AS first_account,MAX(account_id) AS last_account FROM accounts;"
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT COUNT(*) AS total_accounts,MIN(account_id) AS first_account,MAX(account_id) AS last_account FROM accounts;"
+docker compose run --rm schema-migrator python -m scripts.demo_verify_ab
+
+# 02 REQUIRED EXPERIMENT 2 - REPLICA LOAD DISTRIBUTION AND HEALTHY REPLICAS
+1..16 | ForEach-Object { (Invoke-RestMethod "$base/accounts/A0500/balance").served_by } | Group-Object | Format-Table Name,Count
+1..16 | ForEach-Object { (Invoke-RestMethod "$base/accounts/A1500/balance").served_by } | Group-Object | Format-Table Name,Count
+Invoke-RestMethod "$base/debug/replicas/A" | ConvertTo-Json
+Invoke-RestMethod "$base/debug/replicas/B" | ConvertTo-Json
+
+# 03 REQUIRED EXPERIMENT 3 - CONCURRENT DEPOSITS/WITHDRAWALS ACROSS REPLICAS
+$balanceBefore = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+$depId = 'video-deposit-' + [guid]::NewGuid().ToString('N')
+Invoke-RestMethod "$base/accounts/A0500/deposit" -Method Post -ContentType application/json -Body (@{amount='1.00'; request_id=$depId} | ConvertTo-Json) | ConvertTo-Json
+$wId = 'video-withdraw-' + [guid]::NewGuid().ToString('N')
+Invoke-RestMethod "$base/accounts/A0500/withdraw" -Method Post -ContentType application/json -Body (@{amount='1.00'; request_id=$wId} | ConvertTo-Json) | ConvertTo-Json
+$balanceAfter = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+if ($balanceBefore -ne $balanceAfter) { throw 'Failed local debit-credit balance check' }
+$beforeParallel = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+$parallelJobs = @(1..16 | ForEach-Object {
+    $op = if ($_ -le 8) {'deposit'} else {'withdraw'}
+    Start-Job -ArgumentList $base,$op -ScriptBlock { param($url,$operation)
+        $id = 'video-parallel-' + [guid]::NewGuid().ToString('N')
+        Invoke-RestMethod "$url/accounts/A0500/$operation" -Method Post -ContentType application/json -Body (@{amount='0.01';request_id=$id} | ConvertTo-Json)
+    }
+})
+$parallelJobs | Wait-Job | Out-Null
+$parallelReplies = @($parallelJobs | Receive-Job -ErrorAction Stop)
+$parallelJobs | Remove-Job
+$parallelReplies | Group-Object served_by | Format-Table Name,Count
+if ($parallelReplies.Count -ne 16 -or @($parallelReplies | Where-Object {$_.status -ne 'COMMITTED'}).Count -ne 0) { throw 'Concurrent operation incomplete' }
+$afterParallel = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+"BEFORE=$beforeParallel AFTER=$afterParallel"
+if ($beforeParallel -ne $afterParallel) { throw 'Concurrent operations changed net balance' }
+
+# 04 REQUIRED EXPERIMENT 4 - REPLICA INTERRUPTION UNDER LOAD AND GATEWAY FAILOVER
+
+$traffic = Start-Job -ArgumentList $base -ScriptBlock { param($url)
+    1..45 | ForEach-Object { try { (Invoke-RestMethod "$url/accounts/A0500/balance").served_by } catch {'UNAVAILABLE'}; Start-Sleep -Milliseconds 250 }
+}
+$oldA1 = @(docker ps -q --filter 'label=banking.project=banking-video-ab' --filter 'label=banking.shard=A' --filter 'label=banking.slot=1' --filter 'status=running')
+if ($oldA1.Count -ne 1) { throw 'Expected exactly one running A1' }
+docker stop $oldA1[0]
+Require-DockerSuccess 'stop replica A1'
+$traffic | Wait-Job | Out-Null
+$traffic | Receive-Job | Group-Object | Format-Table Name,Count
+$traffic | Remove-Job
+docker compose logs --tail 45 self-healing
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT replica_id,generation,lifecycle,hostname,container_id FROM replica_registry WHERE shard_id='A' ORDER BY slot;"
+Invoke-RestMethod "$base/debug/replicas/A" | ConvertTo-Json
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=preflight
+Require-DockerSuccess 'two healthy A and B replica slots after failure'
+
+# 05 REQUIRED EXPERIMENT 5 - LOCAL TRANSFER, CROSS-SHARD 2PC AND DURABLE VOTES
+
+'A0001','A0500' | ForEach-Object { Invoke-RestMethod "$base/accounts/$_/balance" } | Format-Table
+$localId = 'video-local-' + [guid]::NewGuid().ToString('N')
+Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body (@{from_account='A0001';to_account='A0500';amount='1.00';request_id=$localId} | ConvertTo-Json) | ConvertTo-Json
+'A0001','A0500' | ForEach-Object { Invoke-RestMethod "$base/accounts/$_/balance" } | Format-Table
+$localUndo = 'video-local-undo-' + [guid]::NewGuid().ToString('N')
+Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body (@{from_account='A0500';to_account='A0001';amount='1.00';request_id=$localUndo} | ConvertTo-Json) | ConvertTo-Json
+$abBeforeA = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+$abBeforeB = [decimal](Invoke-RestMethod "$base/accounts/A1500/balance").balance
+$ridAB = 'video-2pc-ab-' + [guid]::NewGuid().ToString('N')
+$bodyAB = @{from_account='A0500';to_account='A1500';amount='1.00';request_id=$ridAB} | ConvertTo-Json
+try { Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body $bodyAB | ConvertTo-Json -Depth 8 } catch { "UNCERTAIN: $ridAB" }
+$abState = Wait-TxFinal $ridAB
+$abState | ConvertTo-Json -Depth 8
+if ($abState.status -ne 'COMMITTED') { throw "A/B transfer not committed: $ridAB" }
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT t.tx_id,t.state,t.decision,p.shard_id,p.vote,p.completion_ack FROM transactions t JOIN transaction_participants p ON p.tx_id=t.tx_id WHERE t.client_request_id='$ridAB' ORDER BY p.shard_id;"
+docker compose exec -T shard-a-db psql -U banking -d shard_a -c "SELECT gid,prepared FROM pg_prepared_xacts WHERE database=current_database();"
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT gid,prepared FROM pg_prepared_xacts WHERE database=current_database();"
+"A before=$abBeforeA after=$((Invoke-RestMethod "$base/accounts/A0500/balance").balance)"
+"B before=$abBeforeB after=$((Invoke-RestMethod "$base/accounts/A1500/balance").balance)"
+Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body $bodyAB | ConvertTo-Json -Depth 8
+if ([decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance -ne ($abBeforeA - 1) -or [decimal](Invoke-RestMethod "$base/accounts/A1500/balance").balance -ne ($abBeforeB + 1)) { throw 'Retry changed the balances twice' }
+$abortBeforeA = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+$abortBeforeB = [decimal](Invoke-RestMethod "$base/accounts/A1500/balance").balance
+$abortAmount = ($abortBeforeB + [decimal]100).ToString('0.00',[System.Globalization.CultureInfo]::InvariantCulture)
+$abortId = 'video-2pc-abort-' + [guid]::NewGuid().ToString('N')
+try { Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body (@{from_account='A1500';to_account='A0500';amount=$abortAmount;request_id=$abortId} | ConvertTo-Json) | ConvertTo-Json -Depth 8 } catch { if ([int]$_.Exception.Response.StatusCode -ne 409) { throw }; 
+"EXPECTED HTTP 409; $($_.ErrorDetails.Message)" }
+
+# 05B FINAL 2PC ABORT PROOF - HTTP 409, DURABLE ABORT, TWO ACKS, UNCHANGED 
+BALANCES
+
+Write-Host "ABORT REQUEST ID: $abortId"
+Write-Host 'FINAL HTTP RESPONSE FOR THE SAME ABORTED REQUEST:'
+& curl.exe --silent --show-error --max-time 10 --include "$base/transfers/requests/$abortId"
+if ($LASTEXITCODE -ne 0) { throw 'Could not read aborted transaction status' }
+$abortHttpCode = (& curl.exe --silent --show-error --max-time 10 --output NUL --write-out '%{http_code}' "$base/transfers/requests/$abortId")
+if ($LASTEXITCODE -ne 0 -or $abortHttpCode -ne '409') { throw "Expected final HTTP 409 for ABORT; got $abortHttpCode" }
+$abortJson = & curl.exe --silent --show-error --max-time 10 "$base/transfers/requests/$abortId"
+if ($LASTEXITCODE -ne 0) { throw 'Could not retrieve ABORT JSON body' }
+$abortResult = $abortJson | ConvertFrom-Json
+$abortResult | ConvertTo-Json -Depth 8
+if ($abortResult.request_id -ne $abortId -or $abortResult.status -ne 'ABORTED' -or $abortResult.state -ne 'COMPLETED' -or $abortResult.decision -ne 'ABORT') { throw 'Final ABORT status does not match the original request' }
+if (@($abortResult.participants).Count -ne 2 -or @($abortResult.participants | Where-Object { $_.ack -ne $true }).Count -ne 0) { throw 'ABORT has not been acknowledged by both shards' }
+Write-Host 'DURABLE 2PC VOTES AND FINAL DECISION IN METADATA:'
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT t.client_request_id,t.tx_id,t.state,t.decision,p.shard_id,p.vote,p.completion_ack FROM transactions t JOIN transaction_participants p ON p.tx_id=t.tx_id WHERE t.client_request_id='$abortId' ORDER BY p.shard_id;"
+Require-DockerSuccess 'read durable ABORT decision and votes'
+$abortAfterA = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+$abortAfterB = [decimal](Invoke-RestMethod "$base/accounts/A1500/balance").balance
+Write-Host "A0500 before=$abortBeforeA after=$abortAfterA"
+Write-Host "A1500 before=$abortBeforeB after=$abortAfterB"
+if ($abortAfterA -ne $abortBeforeA -or $abortAfterB -ne $abortBeforeB) { throw 'ABORTED transfer changed account balances' }
+Write-Host 'PASS: SAME REQUEST ABORTED, BOTH PARTICIPANTS ACKNOWLEDGED, NO MONEY MOVED'
+$ridABUndo = 'video-2pc-ab-undo-' + [guid]::NewGuid().ToString('N')
+try { Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body (@{from_account='A1500';to_account='A0500';amount='1.00';request_id=$ridABUndo} | ConvertTo-Json) | ConvertTo-Json -Depth 8 } catch { "UNCERTAIN: $ridABUndo" }
+if ((Wait-TxFinal $ridABUndo).status -ne 'COMMITTED') { throw 'A/B compensation is unresolved' }
+
+# 06 REQUIRED EXPERIMENT 6 - INTERRUPTED 2PC AFTER DURABLE COMMIT AND RESTART RECOVERY
+$env:STAGE07_ENABLE_FAULTS = '1'
+docker compose up -d --no-deps --force-recreate coordinator
+$crashRequest = 'stage07-crash-' + [guid]::NewGuid().ToString('N')
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=arm --request-id $crashRequest
+Require-DockerSuccess 'stage07 arm'
+try { Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body (@{from_account='A0500';to_account='A1500';amount='1.00';request_id=$crashRequest} | ConvertTo-Json) | ConvertTo-Json } catch { "EXPECTED COORDINATOR CRASH: $crashRequest" }
+docker compose ps -a coordinator
+Invoke-RestMethod "$base/transfers/requests/$crashRequest" | ConvertTo-Json -Depth 8
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT t.state,t.decision,p.shard_id,p.vote,p.completion_ack FROM transactions t JOIN transaction_participants p ON t.tx_id=p.tx_id WHERE t.client_request_id='$crashRequest' ORDER BY p.shard_id;"
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT gid,prepared FROM pg_prepared_xacts WHERE database=current_database();"
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=crashed --request-id $crashRequest
+Require-DockerSuccess 'stage07 actual crash evidence'
+$coordinatorId = docker compose -p banking-video-ab ps -a -q coordinator
+
+if (-not $coordinatorId) {
+    throw "Coordinator container not found"
+}
+
+docker start $coordinatorId
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=recovered --request-id $crashRequest
+Require-DockerSuccess 'stage07 recovered decision'
+Invoke-RestMethod "$base/transfers/requests/$crashRequest" | ConvertTo-Json -Depth 8
+docker compose run --rm schema-migrator python -m scripts.verify_stage07 --scenario=cleanup --request-id $crashRequest
+Require-DockerSuccess 'stage07 compensating transaction'
+$env:STAGE07_ENABLE_FAULTS = '0'
+docker compose up -d --no-deps --force-recreate coordinator
+
+# 07 REQUIRED EXPERIMENT 7 - CONCURRENT OVERLAPPING CROSS-SHARD A/B TRANSFERS
+$startA = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+$startB = [decimal](Invoke-RestMethod "$base/accounts/A1500/balance").balance
+$ids = @(1..4 | ForEach-Object { 'video-2pc-par-' + [guid]::NewGuid().ToString('N') })
+$crossJobs = @($ids | ForEach-Object { Start-Job -ArgumentList $base,$_ -ScriptBlock { param($url,$id)
+    try { Invoke-RestMethod "$url/transfers" -Method Post -ContentType application/json -Body (@{from_account='A0500';to_account='A1500';amount='1.00';request_id=$id} | ConvertTo-Json) | Out-Null } catch { "UNKNOWN $id" }
+}})
+$crossJobs | Wait-Job | Out-Null
+$crossJobs | Receive-Job
+$crossJobs | Remove-Job
+foreach ($id in $ids) { $st = Wait-TxFinal $id; "REQUEST=$id STATUS=$($st.status) TX=$($st.tx_id)"; if ($st.status -ne 'COMMITTED') {throw "Non-committed request $id"} }
+$endA = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance
+$endB = [decimal](Invoke-RestMethod "$base/accounts/A1500/balance").balance
+"A: $startA -> $endA; B: $startB -> $endB"
+if (($startA-$endA) -ne 4 -or ($endB-$startB) -ne 4 -or ($startA+$startB) -ne ($endA+$endB)) {throw 'Overlapping transfer conservation failure'}
+$reverseId = 'video-concurrent-reverse-' + [guid]::NewGuid().ToString('N')
+try { Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body (@{from_account='A1500';to_account='A0500';amount='4.00';request_id=$reverseId} | ConvertTo-Json) | ConvertTo-Json -Depth 8 } catch { "UNKNOWN REVERSE REQUEST: $reverseId" }
+if ((Wait-TxFinal $reverseId).status -ne 'COMMITTED') { throw 'The compensating transfer is unresolved' }
+
+# 08 BONUS I - LIVE EXPANSION: CREATE SHARD C WHILE SHARDS A AND B STAY ONLINE
+Invoke-RestMethod "$base/debug/shard-map" | ConvertTo-Json -Depth 8
+docker compose --profile expansion up -d shard-c-db
+Require-DockerSuccess 'started shard C database container'
+for ($i = 0; $i -lt 60; $i++) {
+    $probe = & docker compose -p banking-video-ab --profile expansion exec -T shard-c-db pg_isready -h 127.0.0.1 -p 5432 -U banking -d shard_c 2>&1
+    if ($LASTEXITCODE -eq 0) { break }
+    Start-Sleep -Seconds 2
+}
+if ($LASTEXITCODE -ne 0) { throw 'Shard C PostgreSQL TCP is not ready. Do not run migrations yet.' }
+Write-Host 'SHARD C TCP READY: banking-video-ab'
+docker compose --profile expansion run --rm --no-deps schema-migrator python -m scripts.demo_migrate --targets shard-c
+Require-DockerSuccess 'applied shard C migrations'
+docker compose --profile expansion up -d --no-deps shard-c-1 shard-c-2 migration-manager
+docker compose --profile expansion run --rm schema-migrator python -m scripts.demo_enable_c
+Require-DockerSuccess 'new shard C online, still not authoritative'
+Invoke-RestMethod "$base/debug/replicas/C" | ConvertTo-Json
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT shard_id,desired_count FROM desired_replica_count ORDER BY shard_id;"
+docker compose run --rm schema-migrator python -m scripts.verify_stage11 --scenario=preflight
+Invoke-RestMethod "$base/accounts/A2000/balance" | ConvertTo-Json
+
+# 09 BONUS I - ONLINE SNAPSHOT, CHANGE CAPTURE AND IDEMPOTENT REPLAY
+docker compose run --rm schema-migrator python -m scripts.verify_stage11 --scenario=bootstrap
+Require-DockerSuccess 'copy consistent snapshot to C'
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT account_id,balance,version FROM accounts WHERE account_id='A2000';"
+docker compose exec -T shard-c-db psql -U banking -d shard_c -c "SELECT account_id,balance,version FROM migration_target_accounts WHERE account_id='A2000';"
+$onlineTraffic = Start-Job -ArgumentList $base -ScriptBlock { param($url)
+    $d = 'video-during-copy-' + [guid]::NewGuid().ToString('N')
+    $w = 'video-during-copy-undo-' + [guid]::NewGuid().ToString('N')
+    Invoke-RestMethod "$url/accounts/A2000/deposit" -Method Post -ContentType application/json -Body (@{amount='0.01';request_id=$d} | ConvertTo-Json)
+    Invoke-RestMethod "$url/accounts/A2000/withdraw" -Method Post -ContentType application/json -Body (@{amount='0.01';request_id=$w} | ConvertTo-Json)
+}
+$onlineTraffic | Wait-Job | Out-Null
+$onlineTraffic | Receive-Job | Select-Object status,served_by,request_id | Format-Table
+$onlineTraffic | Remove-Job
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT account_id,version,before_balance,after_balance FROM account_changes WHERE account_id='A2000' ORDER BY version DESC LIMIT 8;"
+docker compose run --rm schema-migrator python -m scripts.verify_stage11 --scenario=online
+Require-DockerSuccess 'online B writes and idempotent replay in C'
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT account_id,balance,version FROM accounts WHERE account_id='A2000';"
+docker compose exec -T shard-c-db psql -U banking -d shard_c -c "SELECT account_id,balance,version FROM migration_target_accounts WHERE account_id='A2000';"
+Invoke-RestMethod "$base/debug/shard-map" | ConvertTo-Json -Depth 8
+
+# 10 BONUS I - ATOMIC CUTOVER B TO C WITH PERSISTENT EPOCH
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=preflight
+docker compose run --rm schema-migrator python -m scripts.verify_stage12 --scenario=cutover
+Require-DockerSuccess 'durable one-way cutover B to C'
+Invoke-RestMethod "$base/debug/shard-map" | ConvertTo-Json -Depth 8
+'A0500','A1500','A2000' | ForEach-Object { Invoke-RestMethod "$base/debug/route/$_" } | Format-Table
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT range_start,range_end,epoch,writable FROM ownership_fences ORDER BY range_start;"
+docker compose exec -T shard-c-db psql -U banking -d shard_c -c "SELECT range_start,range_end,epoch,writable FROM ownership_fences ORDER BY range_start;"
+docker compose run --rm schema-migrator python -m scripts.backfill_stage13
+Require-DockerSuccess 'legacy request-id archive'
+
+# 11 BONUS I - STALE ROUTE WRITE FENCING ENFORCED BY SHARD B
+$bReplicaHost = (docker compose exec -T metadata-db psql -U banking -d metadata -At -c "SELECT hostname FROM replica_registry WHERE shard_id='B' AND lifecycle='HEALTHY' ORDER BY slot LIMIT 1;").Trim()
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT account_id,balance,version FROM accounts WHERE account_id='A2000';"
+$staleReq = 'video-stale-' + [guid]::NewGuid().ToString('N')
+docker compose exec -T gateway python -c "import httpx; r=httpx.post('http://${bReplicaHost}:8000/internal/accounts/A2000/deposit',json={'amount':'1.00','request_id':'$staleReq'},headers={'X-Expected-Shard':'B','X-Routing-Epoch':'1'},timeout=10); print('STALE STATUS',r.status_code); print(r.text); assert r.status_code==409"
+docker compose exec -T shard-b-db psql -U banking -d shard_b -c "SELECT account_id,balance,version FROM accounts WHERE account_id='A2000';"
+
+# 12 BONUS I - POST-MIGRATION A/C 2PC AND CONSERVATION OF MONEY
+$sumBefore = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance + [decimal](Invoke-RestMethod "$base/accounts/A2000/balance").balance
+$newId = 'video-postcutover-' + [guid]::NewGuid().ToString('N')
+try { Invoke-RestMethod "$base/transfers" -Method Post -ContentType application/json -Body (@{from_account='A0500';to_account='A2000';amount='1.00';request_id=$newId} | ConvertTo-Json) | ConvertTo-Json -Depth 8 } catch { "UNCERTAIN: $newId" }
+$newState = Wait-TxFinal $newId
+$newState | ConvertTo-Json -Depth 8
+if ($newState.status -ne 'COMMITTED') { throw "A/C transfer not committed: $newId" }
+$sumAfter = [decimal](Invoke-RestMethod "$base/accounts/A0500/balance").balance + [decimal](Invoke-RestMethod "$base/accounts/A2000/balance").balance
+"MONEY TOTAL BEFORE=$sumBefore AFTER=$sumAfter"
+if ($sumBefore -ne $sumAfter) { throw 'Money was not conserved' }
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT t.state,t.decision,p.shard_id,p.vote,p.completion_ack FROM transactions t JOIN transaction_participants p ON p.tx_id=t.tx_id WHERE t.client_request_id='$newId' ORDER BY p.shard_id;"
+
+# 13 BONUS I - POST-CUTOVER AUDIT FOR OWNER MAP, EPOCH AND PREPARED TRANSACTIONS
+docker compose run --rm schema-migrator python -m scripts.verify_stage13 --scenario=preflight
+Require-DockerSuccess 'stage13 duplicate protection archive ready'
+docker compose run --rm schema-migrator python -m scripts.verify_stage14 --scenario=postcutover --json
+Require-DockerSuccess 'read-only postcutover audit'
+
+# 14 BONUS I - SAFE ISOLATED CRASH LABS; EVERY EXPERIMENT USES A NEW PROJECT
+function Invoke-CheckedLabCompose([string]$Project, [string[]]$Commands) {
+    & docker compose -p $Project @Commands
+    if ($LASTEXITCODE -ne 0) { throw "Compose failed in $Project : $($Commands -join ' ')" }
+}
+function Wait-ShardCTcpReady([string]$Project) {
+    for ($i = 0; $i -lt 60; $i++) {
+        $probe = & docker compose -p $Project --profile expansion exec -T shard-c-db pg_isready -h 127.0.0.1 -p 5432 -U banking -d shard_c 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "SHARD C TCP READY: $Project"
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "Shard C PostgreSQL did not accept TCP connections in $Project. Preserve this lab for inspection."
+}
+function Wait-Stage14Fault([string]$Project, [string]$Point) {
+    for ($i = 0; $i -lt 25; $i++) {
+        $sql = "SELECT COALESCE((SELECT state::text FROM stage14_fault_experiments WHERE point='$Point' ORDER BY created_at DESC LIMIT 1),'MISSING');"
+        $state = (& docker compose -p $Project exec -T metadata-db psql -U banking -d metadata -t -A -c $sql) | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "Cannot query fault state in $Project" }
+        if ($state.Trim() -eq 'FIRED') {
+            Write-Host "CONFIRMED FIRED: $Point in $Project"
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "Fault was not FIRED: $Point in $Project. Preserve lab for investigation."
+}
+function Wait-Stage14CutoverRecovery([string]$Project) {
+    for ($i = 0; $i -lt 30; $i++) {
+        $sql = "SELECT phase FROM migration_jobs WHERE source_shard='B' AND target_shard='C' ORDER BY created_at DESC LIMIT 1;"
+        $phase = (& docker compose -p $Project exec -T metadata-db psql -U banking -d metadata -t -A -c $sql) | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "Cannot query recovery phase in $Project" }
+        Write-Host "RECOVERY PHASE: $($phase.Trim())"
+        if ($phase.Trim() -in @('VERIFYING','COMPLETED')) { return }
+        Start-Sleep -Seconds 3
+    }
+    throw "Cutover recovery has not completed in $Project. Preserve lab for investigation."
+}
+function Invoke-Stage14Lab {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet('SNAPSHOT_PERSISTED','DELTA_GROUP_APPLIED','FENCING_GATE_CLOSED','MAP_ACTIVATED')]
+        [string]$Point,
+        [Parameter(Mandatory=$true)]
+        [int]$Port
+    )
+    $slug = @{
+        SNAPSHOT_PERSISTED = 'snapshot'
+        DELTA_GROUP_APPLIED = 'delta'
+        FENCING_GATE_CLOSED = 'fencing'
+        MAP_ACTIVATED = 'map'
+    }[$Point]
+    $suffix = [guid]::NewGuid().ToString('N').Substring(0,8)
+    $project = "banking-v-$slug-$suffix"
+    $labBase = "http://localhost:$Port"
+    $saved = @{}
+    $keys = @('COMPOSE_PROJECT_NAME','GATEWAY_PORT','STAGE07_ENABLE_FAULTS','STAGE09_ENABLE_FAULTS','STAGE14_ENABLE_FAULTS')
+    foreach ($key in $keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key,'Process') }
+    $labSucceeded = $false
+    Push-Location 'E:\SharifiProject\sharding\banking-video-ab'
+    try {
+        if ($project -eq 'banking-video-ab') { throw 'Refusing to use the main demo project' }
+        $portInUse = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+        if ($portInUse.Count -gt 0) { throw "Port $Port is in use. Use a free port for this lab." }
+        $existingContainers = @(docker ps -a -q --filter "label=com.docker.compose.project=$project" | Where-Object { $_ })
+        $existingVolumes = @(docker volume ls -q --filter "label=com.docker.compose.project=$project" | Where-Object { $_ })
+        $existingNetworks = @(docker network ls -q --filter "label=com.docker.compose.project=$project" | Where-Object { $_ })
+        if ($existingContainers.Count -gt 0 -or $existingVolumes.Count -gt 0 -or $existingNetworks.Count -gt 0) {
+            throw "Not a fresh project: $project"
+        }
+        $env:COMPOSE_PROJECT_NAME = $project
+        $env:GATEWAY_PORT = [string]$Port
+        $env:STAGE07_ENABLE_FAULTS = '0'
+        $env:STAGE09_ENABLE_FAULTS = '0'
+        $env:STAGE14_ENABLE_FAULTS = '1'
+        Write-Host "ACTIVE ISOLATED LAB: $project"
+        Write-Host "GATEWAY: $labBase"
+        Invoke-CheckedLabCompose $project @('config','--quiet')
+        Invoke-CheckedLabCompose $project @('up','-d','--build','metadata-db','shard-a-db','shard-b-db','schema-migrator','shard-a-1','shard-a-2','shard-b-1','shard-b-2','coordinator','gateway','self-healing')
+        Invoke-CheckedLabCompose $project @('--profile','expansion','up','-d','shard-c-db')
+        Wait-ShardCTcpReady $project
+        Invoke-CheckedLabCompose $project @('--profile','expansion','run','--rm','--no-deps','schema-migrator','python','-m','scripts.demo_migrate','--targets','shard-c')
+        Invoke-CheckedLabCompose $project @('--profile','expansion','up','-d','--no-deps','shard-c-1','shard-c-2','migration-manager')
+        Invoke-CheckedLabCompose $project @('--profile','expansion','run','--rm','--no-deps','schema-migrator','python','-m','scripts.demo_enable_c')
+        Invoke-CheckedLabCompose $project @('exec','-T','metadata-db','psql','-U','banking','-d','metadata','-c',"SELECT job_id,phase FROM migration_jobs ORDER BY created_at DESC LIMIT 3;")
+        if ($Point -eq 'SNAPSHOT_PERSISTED') {
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.stage14_fault','--action','plan')
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','-e','STAGE14_ENABLE_FAULTS=1','schema-migrator','python','-m','scripts.stage14_fault','--action','arm','--point',$Point)
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.stage14_fault','--action','trigger','--point',$Point)
+        } elseif ($Point -eq 'DELTA_GROUP_APPLIED') {
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage10','--scenario=bootstrap')
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage11','--scenario=bootstrap')
+            Invoke-CheckedLabCompose $project @('--profile','expansion','stop','migration-manager')
+            $depositId = 'video-delta-in-' + [guid]::NewGuid().ToString('N')
+            $depositResult = Invoke-RestMethod "$labBase/accounts/A2000/deposit" -Method Post -ContentType application/json -Body (@{amount='1.00';request_id=$depositId} | ConvertTo-Json)
+            if ($depositResult.status -ne 'COMMITTED') { throw "Deposit not committed: $depositId" }
+            $withdrawId = 'video-delta-out-' + [guid]::NewGuid().ToString('N')
+            $withdrawResult = Invoke-RestMethod "$labBase/accounts/A2000/withdraw" -Method Post -ContentType application/json -Body (@{amount='1.00';request_id=$withdrawId} | ConvertTo-Json)
+            if ($withdrawResult.status -ne 'COMMITTED') { throw "Withdrawal not committed: $withdrawId" }
+            Write-Host "SOURCE WRITES COMMITTED: $depositId $withdrawId"
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','-e','STAGE14_ENABLE_FAULTS=1','schema-migrator','python','-m','scripts.stage14_fault','--action','arm','--point',$Point)
+            Invoke-CheckedLabCompose $project @('--profile','expansion','start','migration-manager')
+        } else {
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage10','--scenario=bootstrap')
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage11','--scenario=bootstrap')
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage11','--scenario=online')
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage12','--scenario=preflight')
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','-e','STAGE14_ENABLE_FAULTS=1','schema-migrator','python','-m','scripts.stage14_fault','--action','arm','--point',$Point)
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.stage14_fault','--action','trigger','--point',$Point)
+        }
+        Wait-Stage14Fault $project $Point
+        Invoke-CheckedLabCompose $project @('--profile','expansion','ps','-a','migration-manager')
+        Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.stage14_fault','--action','inspect')
+        Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.stage14_fault','--action','verify','--point',$Point,'--moment','crashed')
+        $env:STAGE14_ENABLE_FAULTS = '0'
+        Invoke-CheckedLabCompose $project @('--profile','expansion','up','-d','--no-deps','--force-recreate','migration-manager')
+        if ($Point -eq 'SNAPSHOT_PERSISTED') {
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage10','--scenario=bootstrap')
+        } elseif ($Point -eq 'DELTA_GROUP_APPLIED') {
+            Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.verify_stage11','--scenario=resume')
+        } else {
+            Wait-Stage14CutoverRecovery $project
+        }
+        Invoke-CheckedLabCompose $project @('run','--rm','--no-deps','schema-migrator','python','-m','scripts.stage14_fault','--action','verify','--point',$Point,'--moment','recovered')
+        $labSucceeded = $true
+        Write-Host "SUCCESS: $Point crash and recovery verified in $project"
+        Invoke-CheckedLabCompose $project @('--profile','expansion','stop')
+        Write-Host "LAB STOPPED WITHOUT DELETING DATA: $project"
+    } finally {
+        foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key,$saved[$key],'Process') }
+        Pop-Location
+        if (-not $labSucceeded) {
+            Write-Host "LAB NOT COMPLETED; NO MAIN PROJECT COMMANDS WERE RUN. Inspect only: $project" 
+            Write-Host "docker compose -p $project --profile expansion ps -a"
+        }
+    }
+}
+
+# 15 BONUS I - SNAPSHOT CRASH AND DURABLE RECOVERY, NEW PROJECT
+Invoke-Stage14Lab -Point SNAPSHOT_PERSISTED -Port 8391
+
+# 16 BONUS I - DELTA REPLAY CRASH AND IDEMPOTENT RECOVERY, NEW PROJECT
+Invoke-Stage14Lab -Point DELTA_GROUP_APPLIED -Port 8392
+
+# 17 BONUS I - FENCING CRASH AND SAFE OWNER SWITCH, NEW PROJECT
+Invoke-Stage14Lab -Point FENCING_GATE_CLOSED -Port 8393
+
+# 18 BONUS I - POST-MAP-ACTIVATION CRASH AND RECOVERY, NEW PROJECT
+Invoke-Stage14Lab -Point MAP_ACTIVATED -Port 8394
+
+# 19 BONUS II - RETURN TO MAIN A/B-TO-C VIDEO PROJECT
+$env:COMPOSE_PROJECT_NAME = 'banking-video-ab'
+$env:GATEWAY_PORT = '8221'
+$env:STAGE07_ENABLE_FAULTS = '0'
+$env:STAGE09_ENABLE_FAULTS = '0'
+$env:STAGE14_ENABLE_FAULTS = '0'
+$base = 'http://localhost:8221'
+Invoke-RestMethod "$base/debug/shard-map" | ConvertTo-Json -Depth 8
+
+# 20 BONUS II - SELF-HEALING REPLICA GENERATIONS AND DYNAMIC REGISTRY
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT replica_id,shard_id,generation,lifecycle,hostname FROM replica_registry ORDER BY shard_id,slot;"
+docker ps --filter 'label=banking.project=banking-video-ab' --format 'table {{.Names}}\t{{.Status}}'
+
+# 21 BONUS II - CRASH THE SELF-HEALING CONTROLLER DURING REPLACEMENT AND RECOVER
+$env:STAGE09_ENABLE_FAULTS = '1'
+docker compose up -d --no-deps --force-recreate self-healing
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=preflight
+$trial = [guid]::NewGuid().ToString()
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=arm --replica=B2 --point=AFTER_CREATE --trial-id=$trial
+Invoke-RestMethod "$base/debug/replicas/B" | ConvertTo-Json
+$runningB2 = @(docker ps -q --filter 'label=banking.project=banking-video-ab' --filter 'label=banking.shard=B' --filter 'label=banking.slot=2' --filter 'status=running')
+if ($runningB2.Count -ne 1) {throw 'Expected one running B2'}
+docker stop $runningB2[0]
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=crashed --trial-id=$trial
+Require-DockerSuccess 'controller crashed after creating replacement'
+docker compose ps -a self-healing
+docker compose exec -T metadata-db psql -U banking -d metadata -c "SELECT replica_id,generation,lifecycle,hostname,container_id FROM replica_registry WHERE replica_id='B2';"
+docker compose start self-healing
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=recovered --trial-id=$trial
+Require-DockerSuccess 'controller reconciled one replacement without duplicates'
+docker compose run --rm schema-migrator python -m scripts.verify_stage09 --scenario=show --trial-id=$trial
+$env:STAGE09_ENABLE_FAULTS = '0'
+docker compose up -d --no-deps --force-recreate self-healing
+
+# 22 FINAL DEMO AUDIT - CONFIRM SHARD C OWNER, FENCES AND NO PREPARED TRANSACTIONS
+$env:COMPOSE_PROJECT_NAME = 'banking-video-ab'
+$env:GATEWAY_PORT = '8221'
+$env:STAGE07_ENABLE_FAULTS = '0'
+$env:STAGE09_ENABLE_FAULTS = '0'
+$env:STAGE14_ENABLE_FAULTS = '0'
+$base = 'http://localhost:8221'
+Invoke-RestMethod "$base/debug/shard-map" | ConvertTo-Json -Depth 8
+docker compose run --rm schema-migrator python -m scripts.verify_stage14 --scenario=postcutover --json
+Require-DockerSuccess 'read-only postcutover audit'

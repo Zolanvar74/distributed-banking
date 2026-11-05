@@ -1,0 +1,309 @@
+name: banking-video-ab
+
+# Deliberately NO Docker automatic restart policies: Bonus II requires
+# a custom self-healing controller, implemented in later stages.
+x-app: &app
+  image: distributed-banking-video-app:ab-to-c
+  build: .
+  networks: [bank-net]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+
+x-postgres: &postgres
+  image: postgres:16
+  networks: [bank-net]
+  environment:
+    POSTGRES_USER: banking
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env first}
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 10s
+
+services:
+  metadata-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Missing .env}
+      POSTGRES_DB: metadata
+    volumes:
+      - metadata-data:/var/lib/postgresql/data
+      - ./sql/metadata/01_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+
+  shard-a-db:
+    <<: *postgres
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    environment:
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Missing .env}
+      POSTGRES_DB: shard_a
+    volumes:
+      - shard-a-data:/var/lib/postgresql/data
+      - ./sql/shard/01_shard_a.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+
+  shard-b-db:
+    <<: *postgres
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    environment:
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Missing .env}
+      POSTGRES_DB: shard_b
+    volumes:
+      - shard-b-data:/var/lib/postgresql/data
+      - ./sql/shard/02_shard_b.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+
+  shard-c-db:
+    profiles: [expansion]
+    <<: *postgres
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    environment:
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Missing .env}
+      POSTGRES_DB: shard_c
+    volumes:
+      - shard-c-data:/var/lib/postgresql/data
+      - ./sql/shard/03_shard_c.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+
+  # One-shot schema migrator. Uses named DB volumes and never resets data.
+  schema-migrator:
+    image: distributed-banking-video-app:ab-to-c
+    build: .
+    command: ["python", "-m", "scripts.demo_bootstrap_ab"]
+    networks: [bank-net]
+    environment:
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+      SHARD_A_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-a-db:5432/shard_a
+      SHARD_B_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-b-db:5432/shard_b
+      SHARD_C_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-c-db:5432/shard_c
+    depends_on:
+      metadata-db: {condition: service_healthy}
+      shard-a-db: {condition: service_healthy}
+      shard-b-db: {condition: service_healthy}
+
+  shard-a-1:
+    <<: *app
+    labels:
+      banking.project: "${COMPOSE_PROJECT_NAME:-banking-video-ab}"
+      banking.role: "replica"
+      banking.shard: "A"
+      banking.slot: "1"
+      banking.generation: "1"
+      banking.managed: "false"
+    command: ["uvicorn", "services.banking.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      SHARD_ID: A
+      REPLICA_GENERATION: "1"
+      REPLICA_ID: A1
+      REPLICA_HOST: shard-a-1
+      SHARD_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-a-db:5432/shard_a
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      shard-a-db: {condition: service_healthy}
+
+  shard-a-2:
+    <<: *app
+    labels:
+      banking.project: "${COMPOSE_PROJECT_NAME:-banking-video-ab}"
+      banking.role: "replica"
+      banking.shard: "A"
+      banking.slot: "2"
+      banking.generation: "1"
+      banking.managed: "false"
+    command: ["uvicorn", "services.banking.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      SHARD_ID: A
+      REPLICA_GENERATION: "1"
+      REPLICA_ID: A2
+      REPLICA_HOST: shard-a-2
+      SHARD_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-a-db:5432/shard_a
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      shard-a-db: {condition: service_healthy}
+
+  shard-b-1:
+    <<: *app
+    labels:
+      banking.project: "${COMPOSE_PROJECT_NAME:-banking-video-ab}"
+      banking.role: "replica"
+      banking.shard: "B"
+      banking.slot: "1"
+      banking.generation: "1"
+      banking.managed: "false"
+    command: ["uvicorn", "services.banking.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      SHARD_ID: B
+      REPLICA_GENERATION: "1"
+      REPLICA_ID: B1
+      REPLICA_HOST: shard-b-1
+      SHARD_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-b-db:5432/shard_b
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      shard-b-db: {condition: service_healthy}
+
+  shard-b-2:
+    <<: *app
+    labels:
+      banking.project: "${COMPOSE_PROJECT_NAME:-banking-video-ab}"
+      banking.role: "replica"
+      banking.shard: "B"
+      banking.slot: "2"
+      banking.generation: "1"
+      banking.managed: "false"
+    command: ["uvicorn", "services.banking.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      SHARD_ID: B
+      REPLICA_GENERATION: "1"
+      REPLICA_ID: B2
+      REPLICA_HOST: shard-b-2
+      SHARD_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-b-db:5432/shard_b
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      shard-b-db: {condition: service_healthy}
+
+  shard-c-1:
+    profiles: [expansion]
+    <<: *app
+    labels:
+      banking.project: "${COMPOSE_PROJECT_NAME:-banking-video-ab}"
+      banking.role: "replica"
+      banking.shard: "C"
+      banking.slot: "1"
+      banking.generation: "1"
+      banking.managed: "false"
+    command: ["uvicorn", "services.banking.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      SHARD_ID: C
+      REPLICA_GENERATION: "1"
+      REPLICA_ID: C1
+      REPLICA_HOST: shard-c-1
+      SHARD_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-c-db:5432/shard_c
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      shard-c-db: {condition: service_healthy}
+
+  shard-c-2:
+    profiles: [expansion]
+    <<: *app
+    labels:
+      banking.project: "${COMPOSE_PROJECT_NAME:-banking-video-ab}"
+      banking.role: "replica"
+      banking.shard: "C"
+      banking.slot: "2"
+      banking.generation: "1"
+      banking.managed: "false"
+    command: ["uvicorn", "services.banking.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      SHARD_ID: C
+      REPLICA_GENERATION: "1"
+      REPLICA_ID: C2
+      REPLICA_HOST: shard-c-2
+      SHARD_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-c-db:5432/shard_c
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      shard-c-db: {condition: service_healthy}
+
+  gateway:
+    <<: *app
+    command: ["uvicorn", "services.gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8221}:8000"
+    environment:
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+      COORDINATOR_URL: http://coordinator:8000
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      coordinator: {condition: service_healthy}
+
+  coordinator:
+    <<: *app
+    command: ["uvicorn", "services.coordinator.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      # Off by default. Enable ONLY in the isolated Stage 07 crash demo.
+      STAGE07_ENABLE_FAULTS: ${STAGE07_ENABLE_FAULTS:-0}
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+
+  migration-manager:
+    profiles: [expansion]
+    <<: *app
+    command: ["uvicorn", "services.migration_manager.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+      SHARD_B_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-b-db:5432/shard_b
+      SHARD_C_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-c-db:5432/shard_c
+      MIGRATION_SCAN_SECONDS: "3"
+      # Never enable in production or the existing long-lived demo.
+      STAGE14_ENABLE_FAULTS: ${STAGE14_ENABLE_FAULTS:-0}
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+      shard-b-db: {condition: service_healthy}
+      shard-c-db: {condition: service_healthy}
+
+  self-healing:
+    <<: *app
+    command: ["uvicorn", "services.self_healing.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      METADATA_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@metadata-db:5432/metadata
+      SHARD_A_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-a-db:5432/shard_a
+      SHARD_B_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-b-db:5432/shard_b
+      SHARD_C_DATABASE_URL: postgresql://banking:${POSTGRES_PASSWORD}@shard-c-db:5432/shard_c
+      INTERNAL_2PC_TOKEN: ${TWO_PC_TOKEN:-local-dev-2pc-token-change-me}
+      HEALING_REPLICA_IMAGE: distributed-banking-video-app:ab-to-c
+      HEALING_DOCKER_NETWORK: "${COMPOSE_PROJECT_NAME:-banking-video-ab}_bank-net"
+      HEALING_PROJECT: "${COMPOSE_PROJECT_NAME:-banking-video-ab}"
+      HEALING_POLL_SECONDS: "2"
+      HEALING_FAILURE_THRESHOLD: "2"
+      HEALING_START_GRACE_SECONDS: "40"
+      # OFF by default. Stage 09 controlled experiment only.
+      STAGE09_ENABLE_FAULTS: ${STAGE09_ENABLE_FAULTS:-0}
+    volumes:
+      # SECURITY: docker.sock gives near-host-root privileges! ONLY local
+      # development. Do not deploy this controller on a shared/public host.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      schema-migrator: {condition: service_completed_successfully}
+      metadata-db: {condition: service_healthy}
+
+networks:
+  bank-net:
+    name: "${COMPOSE_PROJECT_NAME:-banking-video-ab}_bank-net"
+    driver: bridge
+
+volumes:
+  metadata-data:
+  shard-a-data:
+  shard-b-data:
+  shard-c-data:
